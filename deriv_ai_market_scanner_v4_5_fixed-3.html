@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Deriv AI Market Scanner v4.5</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#10131a;color:#f3f4f6}
+.wrap{max-width:980px;margin:auto;padding:16px}
+.card{background:#1b202b;border-radius:16px;padding:16px;margin:12px 0}
+button{background:#ff4b55;color:white;border:0;border-radius:10px;padding:12px 16px;font-weight:700}
+button:disabled{opacity:.5}
+.small{color:#aeb5c2;font-size:13px;line-height:1.4}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th,td{padding:9px;border-bottom:1px solid #303745;text-align:left;font-size:13px}
+.scroll{overflow-x:auto}.score{font-weight:800}.green{color:#55d98b}.yellow{color:#ffd166}.red{color:#ff6972}
+.badge{display:inline-block;padding:3px 7px;border-radius:8px;background:#2b3240;font-size:12px}
+.confirm{border:1px solid #ffd166;border-radius:12px;padding:12px;margin-top:12px;background:#171c26}
+.confirm.ok{border-color:#55d98b}.confirm.warn{border-color:#ffd166}.candle-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:10px}.candle-meta div{background:#10151f;border:1px solid #303745;border-radius:8px;padding:8px}.trigger{border:1px solid #ffd166;border-radius:10px;padding:10px;margin-top:10px;background:#10151f}.trigger.ready{border-color:#55d98b}.mobile-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:12px}.setup-card{background:#171c26;border:1px solid #303745;border-radius:12px;padding:12px}.setup-card .metric{display:flex;justify-content:space-between;gap:10px;margin:5px 0}.planner{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:10px 0}.planner label{font-size:13px;color:#aeb5c2}.planner input{display:block;width:100%;box-sizing:border-box;margin-top:5px;padding:9px;border-radius:8px;border:1px solid #303745;background:#10131a;color:#f3f4f6}.history-row{padding:9px 0;border-bottom:1px solid #303745}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>🤖 Deriv AI Market Scanner v4.5</h1>
+<div class="card">
+<b>SCANNER ONLY — NO TRADING</b>
+<p class="small">This version uses public market data only. It does not log in, use an API token, or place orders. v4 adds live-candle trigger logic, clearer WAIT/READY status, mobile-friendly ranked cards, scan history, and a basic risk-planning calculator. It remains scanner-only and never places trades.</p>
+<div style="display:flex;gap:10px;flex-wrap:wrap"><button id="scan">Run Version 4.5 Scan</button><button id="autoScan" type="button" style="background:#2b3240">Enable Auto-Rescan</button></div>
+<p id="autoStatus" class="small">Auto-rescan is off.</p><p id="status" class="small">Ready. v4.5 uses broader synthetic-market detection and safer auto-rescan behavior with stricter ranking, live-candle confirmation, history, and risk planning.</p>
+</div>
+<div class="card">
+<b>How v4 scores a market</b>
+<p class="small">Trend • EMA200 confirmation • momentum • price structure • pullback quality • volatility. v4 ranks setups and highlights only the strongest candidate. A high score is not an entry signal; confirmation is required.</p>
+</div>
+<div class="card">
+<b>Ranked setups</b>
+<div id="results" class="muted">No scan yet.</div>
+</div>
+<div class="card">
+<b>Risk-management planner</b>
+<p class="small">Planning aid only. Enter your account assumptions; this does not connect to Deriv or place orders.</p>
+<div class="planner">
+<label>Account balance <input id="balance" type="number" min="0" step="0.01" value="100"></label>
+<label>Risk per trade (%) <input id="riskPct" type="number" min="0" max="100" step="0.1" value="1"></label>
+<label>Stop distance (ATR multiples) <input id="atrMult" type="number" min="0.1" step="0.1" value="1.5"></label>
+</div>
+<div id="riskOutput" class="small">Run a scan to calculate a sample risk budget.</div>
+</div>
+<div class="card">
+<b>Scan history</b>
+<div id="history" class="small">No saved scans yet.</div>
+<button id="clearHistory" type="button">Clear history</button>
+</div>
+</div>
+<script>
+const DERIV_APP_ID="1089"; // Testing app ID. Replace with your own registered app ID for production.
+
+function browserEnvironmentOK(){
+  return location.protocol === "https:" || location.protocol === "http:";
+}
+
+function showEnvironmentHint(){
+  const st=document.getElementById("status"), out=document.getElementById("results");
+  if(location.protocol === "file:" || location.protocol === "content:"){
+    st.textContent="This file is not being served from HTTPS.";
+    out.innerHTML=`<div class="card">
+      <b>⚠️ HTTPS REQUIRED</b>
+      <p class="small">The scanner needs to run from a normal HTTPS webpage so the browser can open its live Deriv WebSocket.</p>
+      <p class="small"><b>Next:</b> upload this HTML file to Netlify or another HTTPS host, then open that hosted address in Chrome.</p>
+    </div>`;
+    return false;
+  }
+  return true;
+}
+
+function request(payload, expected){
+  return new Promise((resolve,reject)=>{
+    const url=`wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(DERIV_APP_ID)}`;
+    let settled=false;
+    let ws;
+    let timer;
+
+    const finish=(fn,value)=>{
+      if(settled)return;
+      settled=true;
+      clearTimeout(timer);
+      try{if(ws)ws.close()}catch(e){}
+      fn(value);
+    };
+
+    try{
+      ws=new WebSocket(url);
+    }catch(err){
+      finish(reject,new Error("Browser could not create the Deriv WebSocket. Check your internet connection and browser permissions."));
+      return;
+    }
+
+    timer=setTimeout(()=>{
+      finish(reject,new Error(
+        "Deriv WebSocket timed out after 12 seconds. The site is HTTPS, but the market-data connection did not respond. Check network restrictions or try again."
+      ));
+    },12000);
+
+    ws.onopen=()=>{
+      try{
+        ws.send(JSON.stringify(payload));
+      }catch(err){
+        finish(reject,new Error("The browser opened the connection but could not send the market-data request."));
+      }
+    };
+
+    ws.onmessage=e=>{
+      try{
+        const d=JSON.parse(e.data);
+        if(d.error){
+          finish(reject,new Error(`Deriv rejected the request: ${d.error.message||"Unknown API error"}`));
+          return;
+        }
+        if(d.msg_type===expected){
+          finish(resolve,d);
+        }
+      }catch(err){
+        finish(reject,new Error("Deriv returned an unreadable response."));
+      }
+    };
+
+    ws.onerror=()=>{
+      finish(reject,new Error(
+        "The Deriv WebSocket connection was blocked or failed. Confirm that this page is opened from HTTPS, that your network allows WebSocket connections, and that the configured Deriv app ID is valid."
+      ));
+    };
+
+    ws.onclose=event=>{
+      if(!settled){
+        const code=event&&event.code!=null?` (close code ${event.code})`:"";
+        finish(reject,new Error(
+          `The Deriv WebSocket closed before returning ${expected}${code}. Try the scan again.`
+        ));
+      }
+    };
+  });
+}
+
+async function symbols(){
+  const d=await request({
+    active_symbols:"full",
+    req_id:1
+  },"active_symbols");
+
+  const all=Array.isArray(d.active_symbols)?d.active_symbols:[];
+  // Some public responses omit active_symbols metadata. Keep a conservative
+  // fallback list so candle requests can still test the known synthetic symbols.
+  const fallback=[
+    "R_10","R_25","R_50","R_75","R_100",
+    "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
+    "RB100","RB200","RB300","RB400","RB500",
+    "BOOM500","BOOM1000","CRASH500","CRASH1000"
+  ].map(symbol=>({symbol,display_name:symbol,market:"synthetic",submarket:"random index"}));
+  const source=all.length?all:fallback;
+  const matches=source.filter(s=>{
+    const text=[
+      s.symbol,
+      s.underlying_symbol,
+      s.display_name,
+      s.underlying_symbol_name,
+      s.market,
+      s.submarket,
+      s.symbol_type,
+      s.underlying_symbol_type
+    ].filter(Boolean).join(" ").toLowerCase();
+
+    const market=String(s.market||s.market_name||"").toLowerCase();
+    const submarket=String(s.submarket||s.submarket_name||"").toLowerCase();
+    const symbol=String(s.symbol||s.underlying_symbol||"").toUpperCase();
+    const knownPattern=/^(R_(10|25|50|75|100|150|200|250|300|400|500)|1HZ(10|25|50|75|100|150|200|250|300|400|500)V|RB(100|200|300|400|500)|BOOM(300|500|600|900|1000)|CRASH(300|500|600|900|1000)|JD[1-9]0|RDBULL|RDBEAR)$/;
+    return /synthetic|volatility|boom|crash|jump|step index|range break|random index/.test(text)
+      || market.includes("synthetic")
+      || submarket.includes("random")
+      || knownPattern.test(symbol);
+  });
+
+  const known=[
+    "R_10","R_25","R_50","R_75","R_100",
+    "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
+    "RB100","RB200","RB300","RB400","RB500",
+    "BOOM1000","BOOM500","CRASH1000","CRASH500"
+  ];
+
+  const bySymbol=new Map();
+  [...matches,...source.filter(s=>known.includes(s.symbol||s.underlying_symbol))].forEach(s=>{
+    const key=s.symbol||s.underlying_symbol;
+    if(key&&!bySymbol.has(key))bySymbol.set(key,s);
+  });
+
+  if(!bySymbol.size){
+    throw new Error(`Deriv returned ${all.length} active markets and the fallback list produced no usable symbols.`);
+  }
+  if(!all.length){
+    document.getElementById("status").textContent="Deriv returned no active_symbols metadata; testing a conservative list of known synthetic symbols instead.";
+  }
+
+  return [...bySymbol.values()];
+}
+
+async function candles(symbol){
+  // Request 1-minute candles directly instead of downloading thousands
+  // of ticks and rebuilding candles in the browser.
+  const d=await request({
+    ticks_history:symbol,
+    end:"latest",
+    style:"candles",
+    granularity:60,
+    count:250,
+    req_id:2
+  },"candles");
+
+  const raw=d.candles||[];
+  if(raw.length<205) throw new Error(`Only ${raw.length} one-minute candles returned`);
+
+  return raw.map(x=>({
+    o:Number(x.open),
+    h:Number(x.high),
+    l:Number(x.low),
+    c:Number(x.close),
+    t:Number(x.epoch)
+  })).filter(x=>Number.isFinite(x.o)&&Number.isFinite(x.h)&&Number.isFinite(x.l)&&Number.isFinite(x.c)&&Number.isFinite(x.t))
+    .sort((a,b)=>a.t-b.t);
+}
+
+function ema(a,n){
+ if(a.length<n)return null;
+ let e=a.slice(0,n).reduce((x,y)=>x+y,0)/n,k=2/(n+1);
+ for(let i=n;i<a.length;i++)e=a[i]*k+e*(1-k);
+ return e;
+}
+function atr(cs,n=14){
+ if(cs.length<=n)return null;
+ let tr=[];
+ for(let i=1;i<cs.length;i++){
+   const c=cs[i],p=cs[i-1];
+   tr.push(Math.max(c.h-c.l,Math.abs(c.h-p.c),Math.abs(c.l-p.c)));
+ }
+ let a=tr.slice(0,n).reduce((x,y)=>x+y,0)/n;
+ for(let i=n;i<tr.length;i++)a=((a*(n-1))+tr[i])/n;
+ return a;
+}
+function rsi(a,n=14){
+ if(a.length<=n)return null;
+ let g=0,l=0;
+ for(let i=1;i<=n;i++){let d=a[i]-a[i-1];if(d>0)g+=d;else l-=d}
+ let ag=g/n,al=l/n;
+ for(let i=n+1;i<a.length;i++){
+   let d=a[i]-a[i-1];
+   ag=((ag*(n-1))+(d>0?d:0))/n;
+   al=((al*(n-1))+(d<0?-d:0))/n;
+ }
+ return al===0?100:100-(100/(1+ag/al));
+}
+function slope(a,n=10){
+ if(a.length<n+1)return 0;
+ return (a[a.length-1]-a[a.length-1-n])/n;
+}
+function structure(cs){
+ const last=cs.slice(-12), highs=last.map(x=>x.h), lows=last.map(x=>x.l);
+ const mid=Math.floor(last.length/2);
+ const h1=Math.max(...highs.slice(0,mid)),h2=Math.max(...highs.slice(mid));
+ const l1=Math.min(...lows.slice(0,mid)),l2=Math.min(...lows.slice(mid));
+ return {bull:h2>h1&&l2>l1,bear:h2<h1&&l2<l1};
+}
+function round(x){return Math.round(x*10)/10}
+
+function analyze(cs){
+  const close=cs.map(x=>x.c), price=close.at(-1);
+  const e20=ema(close,20),e50=ema(close,50),e200=ema(close,200);
+  const rv=rsi(close,14),a=atr(cs,14),sl=slope(close,10);
+  const st=structure(cs);
+
+  let bull=0,bear=0,bullReasons=[],bearReasons=[];
+  const add=(side,pts,reason)=>{
+    if(side==="bull"){bull+=pts;bullReasons.push(reason)}
+    else {bear+=pts;bearReasons.push(reason)}
+  };
+
+  // 1) Major trend: EMA50 vs EMA200 (3 points)
+  if(e50>e200) add("bull",3,"EMA50 above EMA200");
+  else if(e50<e200) add("bear",3,"EMA50 below EMA200");
+
+  // 2) EMA200 price confirmation (1 point)
+  if(price>e200) add("bull",1,"price above EMA200");
+  else if(price<e200) add("bear",1,"price below EMA200");
+
+  // 3) Momentum: directional RSI confirmation (2 points)
+  if(rv>=52&&rv<=68) add("bull",2,"RSI bullish confirmation");
+  else if(rv>=32&&rv<=48) add("bear",2,"RSI bearish confirmation");
+  else if(rv>68&&rv<=72) add("bull",1,"RSI bullish but extended");
+  else if(rv>=48&&rv<52) {
+    bull+=0.25; bear+=0.25;
+    bullReasons.push("RSI near neutral");
+    bearReasons.push("RSI near neutral");
+  } else if(rv>72) {
+    bull-=1; bullReasons.push("RSI overbought penalty");
+  } else if(rv<28) {
+    bear-=1; bearReasons.push("RSI oversold penalty");
+  }
+
+  // 4) Market structure (2 points)
+  if(st.bull) add("bull",2,"higher highs + higher lows");
+  else if(st.bear) add("bear",2,"lower highs + lower lows");
+
+  // 5) Pullback / entry quality (1.5 points)
+  if(e20&&e50&&a){
+    const dist=Math.abs(price-e20)/a;
+    if(dist<=0.8){
+      if(price>=e20) add("bull",1.5,"clean EMA20 pullback area");
+      else add("bear",1.5,"clean EMA20 pullback area");
+    } else if(dist<=1.5){
+      if(price>e50) add("bull",0.75,"reasonable EMA20 distance");
+      else if(price<e50) add("bear",0.75,"reasonable EMA20 distance");
+    } else {
+      bull-=0.5; bear-=0.5;
+      bullReasons.push("price extended from EMA20");
+      bearReasons.push("price extended from EMA20");
+    }
+  }
+
+  // 6) Volatility sanity (0.5 point)
+  if(a&&price){
+    const atrPct=a/price*100;
+    if(atrPct>0.005&&atrPct<2){
+      bull+=0.5; bear+=0.5;
+      bullReasons.push("usable volatility");
+      bearReasons.push("usable volatility");
+    } else if(atrPct>=2){
+      bull-=0.5; bear-=0.5;
+      bullReasons.push("very high volatility penalty");
+      bearReasons.push("very high volatility penalty");
+    }
+  }
+
+  bull=Math.max(0,Math.min(10,bull));
+  bear=Math.max(0,Math.min(10,bear));
+
+  const rawDirection=bull>=bear?"BUY":"SELL";
+  const rawScore=rawDirection==="BUY"?bull:bear;
+  const reasons=rawDirection==="BUY"?bullReasons:bearReasons;
+
+  // Require the major trend and EMA200 to agree before calling a setup a candidate.
+  const trendConfirmed = rawDirection==="BUY"
+    ? e50>e200 && price>e200
+    : e50<e200 && price<e200;
+
+  let direction="AVOID";
+  if(trendConfirmed && rawScore>=7) direction=rawDirection+" CANDIDATE";
+  else if(trendConfirmed && rawScore>=5.5) direction="WATCH";
+  else direction="WAIT";
+
+  // Tie-break quality: prefer price closer to EMA20 and RSI in a healthy zone.
+  const emaQuality = (e20&&a) ? Math.max(0,1-Math.abs(price-e20)/a) : 0;
+  const rsiQuality = rawDirection==="BUY"
+    ? Math.max(0,1-Math.abs(rv-58)/18)
+    : Math.max(0,1-Math.abs(rv-42)/18);
+  const quality = rawScore + emaQuality*0.25 + rsiQuality*0.25;
+
+  return {
+    score:round(rawScore),
+    quality,
+    price,e20,e50,e200,rv,a,sl,
+    structureBull:st.bull,structureBear:st.bear,
+    lastCandle:cs.at(-1),prevCandle:cs.at(-2),
+    direction,reasons,trendConfirmed,
+    bullScore:round(bull),bearScore:round(bear)
+  };
+}
+
+
+function money(x){return Number.isFinite(x)?x.toFixed(3):"—"}
+function entryTriggerFor(raw){
+  const buy=raw.direction.startsWith("BUY");
+  const c=raw.lastCandle||{};
+  const p=raw.prevCandle||{};
+  const now=Math.floor(Date.now()/1000);
+  const candleAge=Math.max(0,now-(Number(c.t)||now));
+  // A one-minute candle is treated as closed only after a safety buffer.
+  const closed=Number.isFinite(c.t)&&candleAge>=70;
+  const candleDirection=buy?c.c>c.o:c.c<c.o;
+  const breakout=buy?c.c>p.h:c.c<p.l;
+  const emaSide=buy?c.c>raw.e20:c.c<raw.e20;
+  const trigger=Boolean(closed&&candleDirection&&breakout&&emaSide);
+  const reason=!closed
+    ?"The latest 1-minute candle may still be forming. Wait for the candle to close, then rescan."
+    :!candleDirection
+      ?"The latest closed candle is not directional in the setup's expected direction."
+      :!breakout
+        ?"The latest closed candle has not broken the previous candle's high/low."
+        :!emaSide
+          ?"The latest closed candle is not on the required side of EMA20."
+          :"The latest closed candle meets the direction, breakout, and EMA20 conditions.";
+  return {
+    trigger,closed,candleAge,
+    label:trigger?(buy?"BUY TRIGGER DETECTED":"SELL TRIGGER DETECTED"):"WAIT — LIVE CANDLE TRIGGER NOT CONFIRMED",
+    details:reason
+  };
+}
+function confirmationFor(raw){
+  const buy=raw.direction.startsWith("BUY");
+  const trend=buy?raw.e50>raw.e200&&raw.price>raw.e200:raw.e50<raw.e200&&raw.price<raw.e200;
+  const momentum=buy?raw.rv>=52&&raw.rv<=68:raw.rv>=32&&raw.rv<=48;
+  const structure=buy?raw.structureBull:raw.structureBear;
+  const pullback=raw.e20&&raw.a?Math.abs(raw.price-raw.e20)/raw.a<=1.5:false;
+  const checks=[
+    {name:"Major trend agrees with EMA200",ok:trend},
+    {name:"Momentum is in the confirmation zone",ok:momentum},
+    {name:"Recent price structure agrees",ok:structure},
+    {name:"Price is not too extended from EMA20",ok:pullback}
+  ];
+  const missing=checks.filter(x=>!x.ok).map(x=>x.name);
+  return {checks,missing,ready:missing.length===0&&raw.direction.endsWith("CANDIDATE")};
+}
+function renderRisk(top){
+  const balance=Number(document.getElementById("balance").value)||0;
+  const pct=Number(document.getElementById("riskPct").value)||0;
+  const mult=Number(document.getElementById("atrMult").value)||0;
+  const budget=balance*pct/100;
+  const stop=top&&top.a?top.a*mult:null;
+  document.getElementById("riskOutput").innerHTML=top
+    ? `Selected setup: <b>${top.name}</b><br>Risk budget: <b>${budget.toFixed(2)}</b> account units<br>Sample stop distance: <b>${money(stop)}</b> price units (ATR × ${mult})<br><span class="small">Position sizing depends on the contract's payout, multiplier, and minimum stake. Do not treat this as an executable order size.</span>`
+    : "Run a scan to calculate a sample risk budget.";
+}
+function renderHistory(){
+  const el=document.getElementById("history");
+  let items=[];try{items=JSON.parse(localStorage.getItem("derivScannerHistory")||"[]")}catch(e){}
+  el.innerHTML=items.length?items.map(x=>`<div class="history-row"><b>${x.time}</b> — ${x.name||"No candidate"}<br><span class="small">${x.symbol||""} • ${x.score==null?"—":x.score+"/10"} • ${x.direction||""}</span></div>`).join(""):"No saved scans yet.";
+}
+function saveHistory(top){
+  let items=[];try{items=JSON.parse(localStorage.getItem("derivScannerHistory")||"[]")}catch(e){}
+  items.unshift({time:new Date().toLocaleString(),name:top&&top.name,symbol:top&&top.symbol,score:top&&top.score,direction:top&&top.direction});
+  try{localStorage.setItem("derivScannerHistory",JSON.stringify(items.slice(0,12)))}catch(e){}
+  renderHistory();
+}
+
+async function run(){
+  if(!showEnvironmentHint()) return;
+  const btn=document.getElementById("scan"),st=document.getElementById("status"),out=document.getElementById("results");
+  btn.disabled=true;
+  try{
+    st.textContent="Finding active synthetic markets…";
+    const ss=await symbols();
+    if(!ss.length) throw new Error("No synthetic markets were returned by active_symbols");
+
+    // Scan a broader set than v2.7, while keeping phone/browser load reasonable.
+    const chosen=ss.slice(0,30),rows=[],errors=[];
+    for(let i=0;i<chosen.length;i++){
+      const s=chosen[i];
+      st.textContent=`Analyzing ${i+1}/${chosen.length}: ${s.underlying_symbol_name||s.underlying_symbol}`;
+      try{
+        const scanSymbol=s.symbol||s.underlying_symbol;
+        const cs=await candles(scanSymbol);
+        if(cs.length<205){
+          errors.push(`${scanSymbol}: only ${cs.length} one-minute candles`);
+          continue;
+        }
+        rows.push({
+          name:s.display_name||s.underlying_symbol_name||s.symbol||s.underlying_symbol,
+          symbol:scanSymbol,
+          ...analyze(cs)
+        });
+      }catch(e){
+        errors.push(`${scanSymbol}: ${e.message}`);
+      }
+    }
+
+    // Rank by score first, then technical quality to break ties.
+    rows.sort((a,b)=>b.score-a.score || b.quality-a.quality);
+
+    const candidates=rows.filter(r=>r.direction.endsWith("CANDIDATE"));
+    const top=candidates[0] || null; window.__topSetup=top;
+
+    out.innerHTML =
+      (top ? `<div class="card" style="border:1px solid #55d98b">
+        <b>🏆 TOP SETUP</b>
+        <p style="font-size:20px;margin:8px 0"><b>${top.name}</b></p>
+        <p class="small">${top.symbol}</p>
+        <p><span class="score green">${top.score}/10</span> &nbsp; <b>${top.direction}</b></p>
+        <p class="small">EMA50/EMA200: ${top.e50.toFixed(3)} / ${top.e200.toFixed(3)} • RSI: ${top.rv.toFixed(1)}</p>
+        <p class="small">${top.reasons.join(" • ")}</p>
+        <div class="confirm ${confirmationFor(top).ready?"ok":"warn"}">
+          <b>${confirmationFor(top).ready?"✅ SETUP CHECKS PASSED":"🟡 SETUP CHECKS: WAIT"}</b>
+          <ul>${confirmationFor(top).checks.map(c=>`<li>${c.ok?"✅":"⬜"} ${c.name}</li>`).join("")}</ul>
+          <p class="small">${confirmationFor(top).missing.length?"Still missing: "+confirmationFor(top).missing.join("; "):"All setup rules passed. The live candle trigger below is still required."}</p>
+          <div class="trigger ${entryTriggerFor(top).trigger?"ready":""}">
+            <b>${entryTriggerFor(top).trigger?"🟢":"🟡"} ${entryTriggerFor(top).label}</b>
+            <p class="small">${entryTriggerFor(top).details}</p>
+            <div class="candle-meta">
+              <div><span class="small">Candle status</span><br><b>${entryTriggerFor(top).closed?"Closed":"Possibly forming"}</b></div>
+              <div><span class="small">Candle age</span><br><b>${entryTriggerFor(top).candleAge}s</b></div>
+              <div><span class="small">Confirmation</span><br><b>${entryTriggerFor(top).trigger?"Confirmed":"Not confirmed"}</b></div>
+            </div>
+            <p class="small">Prototype trigger: ${top.direction.startsWith("BUY")?"closed bullish candle + close above previous high + close above EMA20":"closed bearish candle + close below previous low + close below EMA20"}.</p>
+          </div>
+        </div>
+      </div>` :
+      `<div class="card"><b>⚠️ NO STRONG SETUP</b><p class="small">No market reached the strict 7/10 candidate threshold with EMA50 + EMA200 trend confirmation.</p></div>`) +
+
+      (rows.length ? `<div class="mobile-grid">`+
+      rows.map((r,i)=>{
+        const cls=r.score>=7?"green":r.score>=5.5?"yellow":"red";
+        const tag=i===0 && r.direction.endsWith("CANDIDATE")?" 🏆":"";
+        return `<div class="setup-card">
+          <div class="metric"><b>${i+1}${tag} · ${r.name}</b><span class="score ${cls}">${r.score}/10</span></div>
+          <div class="small">${r.symbol}</div>
+          <div class="metric"><span>Direction</span><b>${r.direction}</b></div>
+          <div class="metric"><span>EMA50</span><span>${r.e50.toFixed(3)}</span></div>
+          <div class="metric"><span>EMA200</span><span>${r.e200.toFixed(3)}</span></div>
+          <div class="metric"><span>RSI</span><span>${r.rv.toFixed(1)}</span></div>
+          <div class="small">${r.reasons.join(" • ")}</div>
+        </div>`;
+      }).join("")+"</div>":"")+
+
+      `<p class="small">⚠️ Research prototype. Scores are rules-based measurements, not predictions or guarantees of profit. Only the #1 qualifying candidate is highlighted.</p>`+
+      (errors.length?`<details><summary>Diagnostics (${errors.length})</summary><pre class="small">${errors.join("\n")}</pre></details>`:"");
+
+    st.textContent=`Done — ${rows.length} markets ranked${errors.length?` (${errors.length} skipped)`:""}.`;
+    renderRisk(top);
+    saveHistory(top);
+  }catch(e){
+    st.textContent="Scanner error: "+e.message;
+    out.innerHTML=`<div class="card"><b>⚠️ CONNECTION DIAGNOSTICS</b><p class="small">${e.message}</p><p class="small">Check that this is the live HTTPS Netlify address, then tap Run Scan again. Auto-Rescan can be disabled while troubleshooting.</p></div>`;
+    if(autoScanEnabled){
+      stopAutoScan();
+      updateAutoStatus("Auto-rescan paused after a connection error.");
+    }
+  }finally{btn.disabled=false}
+}
+
+let autoScanEnabled=false;
+let autoScanTimer=null;
+let scanInProgress=false;
+
+async function safeRun(){
+  if(scanInProgress)return;
+  scanInProgress=true;
+  try{
+    await run();
+  }finally{
+    scanInProgress=false;
+  }
+}
+
+function updateAutoStatus(message){
+  const el=document.getElementById("autoStatus");
+  if(el)el.textContent=message;
+}
+
+function stopAutoScan(){
+  autoScanEnabled=false;
+  if(autoScanTimer!==null){
+    clearInterval(autoScanTimer);
+    autoScanTimer=null;
+  }
+  document.getElementById("autoScan").textContent="Enable Auto-Rescan";
+  document.getElementById("autoScan").style.background="#2b3240";
+  updateAutoStatus("Auto-rescan is off.");
+}
+
+function startAutoScan(){
+  autoScanEnabled=true;
+  document.getElementById("autoScan").textContent="Disable Auto-Rescan";
+  document.getElementById("autoScan").style.background="#245c45";
+  updateAutoStatus("Auto-rescan is on — checking for a new closed 1-minute candle every 60 seconds.");
+  safeRun();
+  autoScanTimer=setInterval(()=>{
+    if(!autoScanEnabled)return;
+    updateAutoStatus("Auto-rescan is checking the latest closed 1-minute candle…");
+    safeRun();
+  },60000);
+}
+
+document.getElementById("scan").onclick=safeRun;
+document.getElementById("autoScan").onclick=()=>{
+  if(autoScanEnabled)stopAutoScan();
+  else startAutoScan();
+};
+document.getElementById("clearHistory").onclick=()=>{try{localStorage.removeItem("derivScannerHistory")}catch(e){}renderHistory()};
+["balance","riskPct","atrMult"].forEach(id=>document.getElementById(id).addEventListener("input",()=>renderRisk(window.__topSetup||null)));
+window.addEventListener("beforeunload",stopAutoScan);
+renderHistory();
+showEnvironmentHint();
+</script>
+</body>
+</html>
